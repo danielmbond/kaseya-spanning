@@ -3,7 +3,7 @@
 
 # Tested in PowerShell 7.1 and as of 8/3/2021 MSOnline module doesn't work. Use PowerShell 5.x
 
-# Initial setup.
+#region Initial setup.
 
 # Install-Module MSOnline
 # Install-Module Microsoft.PowerShell.SecretManagement -AllowPrerelease
@@ -13,6 +13,7 @@
 # Set-Secret -Name SpanningLogin -Secret "EMAIL_ADDRESS"
 # Set-Secret -Name 365Login -Secret "EMAIL_ADDRESS"
 # Set-Secret -Name 365Password -Secret "PASSWORD"
+#endregion
 
 Import-Module MSOnline
 
@@ -113,7 +114,6 @@ function remove-spanning-deleted-users-licenses($users = $users) {
     $count = 0
     foreach ($user in $users) {
         if ($user.isDeleted -eq $true) {
-            # Write-Host $($user.userPrincipalName)
             $deletedUsers += "$($user.userPrincipalName),"
             $count++
         }
