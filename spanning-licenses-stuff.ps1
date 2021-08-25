@@ -1,3 +1,4 @@
+Clear-Host
 # Remove o365 Spanning backup licenses from deleted accounts.
 # Add Spanning License to all E5 users.
 
@@ -22,7 +23,8 @@ Write-Host "Here we go."
 $APIKEY = Get-Secret -Vault SecretStore -Name SpanningAPIKey -AsPlainText
 $USERNAME = Get-Secret -Vault SecretStore -Name SpanningLogin -AsPlainText
 $API_URL = "https://o365-api-us.spanningbackup.com/"
-$API_USER_URL = $API_URL + "external/users?size=1000"
+$API_USER_URL_ACTIVE = $API_URL + "external/users?inActiveDirectory=false&size=500"
+$API_USER_URL_DELETED = $API_URL + "external/users?inActiveDirectory=false&size=500"
 $API_ASSIGN_LICENSE = $API_URL + "external/users/assign"
 $API_UNASSIGN_LICENSE = $API_URL + "external/users/unassign"
 $spanningCred = $USERNAME + ":" + $APIKEY
@@ -35,19 +37,26 @@ $M365_USERNAME = Get-Secret -Vault SecretStore -Name 365Login -AsPlainText
 
 #region Fuctions
 function add-spanning-licenses($addUsers) {
-    $addUsers = $addUsers.Trim(",")
-    $addUsersArray = $addUsers.Split(",")
-    $bodyObj = New-Object -TypeName psobject
-    $bodyObj | Add-Member -MemberType NoteProperty -Name userPrincipalNames -Value $addUsersArray -Force
+    if ($addUsers -and $addUsers.Count -gt 0) {
+        $addUsers = $addUsers.Trim(",")
+        $addUsersArray = $addUsers.Split(",")
+        $bodyObj = New-Object -TypeName psobject
+        $bodyObj | Add-Member -MemberType NoteProperty -Name userPrincipalNames -Value $addUsersArray -Force
 
-    $body = $bodyObj | ConvertTo-Json
+        $body = $bodyObj | ConvertTo-Json
 
-    Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_ASSIGN_LICENSE -Body $body
-    $addUsers = ""
-    write-host "$($addUsersArray.Count) users added to Spanning Licenses."
+        try {
+            Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_ASSIGN_LICENSE -Body $body
+        } catch {Failure}
+    
+        $addUsers = ""
+        Write-Host "$($addUsersArray.Count) users added to Spanning Licenses."
+    } else {
+        Write-Host 
+    }
 }
 
-function add-spanning-licenses-to-e5s($licensedUsers = $licensedUsers, $e5s = $e5s) {
+function add-spanning-licenses-to-e5s($licensedUsers = $licensedUsers, $e5s = $e5UPNs) {
     $addUsers = ""
     $count = 0
     foreach ($e5 in $e5s) {
@@ -64,6 +73,67 @@ function add-spanning-licenses-to-e5s($licensedUsers = $licensedUsers, $e5s = $e
     write-host "$count total Spanning Licenses added."
 }
 
+function Expand-UserProperties($user) {
+    $userColumns = "DisplayName", "UserPrincipalName", "AccountEnabled", `
+        "LastDirSyncTime", "Mail", `
+        "MailNickName", "MSExchRecipientTypeDetails", "ObjectId", `
+        "RefreshTokensValidFromDateTime", `
+        "UserType", "WhenCreated"
+    $userTemp = $user | Select-Object $userColumns
+
+    return $userTemp
+}
+
+function Export-MsoUser-Object-To-CSV ($msoUsers=$e5s, $outfile=$null) {
+    if ($null -eq $outfile) {
+        $outfile = Get-Outfile
+    }
+    foreach ($user in $msoUsers) {
+        $userTemp = Expand-UserProperties $user
+
+        if ((Test-Path $outfile) -eq $false) {
+            Write-Host $outfile
+            $userTemp | ConvertTo-Csv -NoTypeInformation | Set-Content -Path $outfile
+        }
+        else {
+            $userTemp | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Out-File -Append $outfile
+        }
+    }
+}
+
+function Get-Outfile($new=$false) {
+    $datetime = (Get-Date -Format "yyyyMMdd-HHmmssK").Replace(":", "")
+    $desktop = "$env:HOMEDRIVE$env:HOMEPATH\Desktop"
+    $Global:outfile = "$desktop\output-$datetime.csv"
+    if ($new -or $null -eq $Global:outfile) {
+        return $Global:outfile
+    } else {
+        return $Global:outfile
+    }
+}
+
+function Failure {
+    $global:helpme = $body
+    $global:helpmoref = $moref
+    $global:result = $_.Exception.Response.GetResponseStream()
+    $global:reader = New-Object System.IO.StreamReader($global:result)
+    $global:responseBody = $global:reader.ReadToEnd();
+    Write-Host -BackgroundColor:Black -ForegroundColor:Red "Status: A system exception was caught."
+    Write-Host -BackgroundColor:Black -ForegroundColor:Red $global:responsebody
+    Write-Host -BackgroundColor:Black -ForegroundColor:Red "The request body has been saved to `$global:helpme"
+}
+
+function Get-Accounts-With-Mailboxes ($accounts) {
+#MSExchRecipientTypeDetails
+    $accountsWithMailbox = @{}
+    foreach ($account in $accounts) {
+        if ($null -ne $account.MSExchRecipientTypeDetails) {
+            $accountsWithMailbox.Add($account,$true)
+        }
+    }
+    return ($accountsWithMailbox.Keys)
+}
+
 function Get-m365-Users($m365Cred = $m365Cred) {
     Import-Module MSOnline
     Connect-MsolService -Credential $m365Cred
@@ -72,7 +142,7 @@ function Get-m365-Users($m365Cred = $m365Cred) {
     return $msolUsers
 }
 
-function get-spanning-users($API_USER_URL = $API_USER_URL) {
+function get-spanning-users($API_USER_URL = $API_USER_URL_DELETED) {
     $firstRun = $true
     $usersHash = @{}
     while ($firstRun -or $users.nextLink) {
@@ -116,28 +186,33 @@ function remove-spanning-deleted-users-licenses($users = $users) {
         if ($user.isDeleted -eq $true) {
             $deletedUsers += "$($user.userPrincipalName),"
             $count++
+            Write-Host $count
+            Write-Host $($deletedUsers.Count)
         }
     }
-    
-    $deletedUsers = $deletedUsers.Trim(",")
-    $deletedUsersArray = $deletedUsers.Split(",")
-    $bodyObj = New-Object -TypeName psobject
-    $bodyObj | Add-Member -MemberType NoteProperty -Name userPrincipalNames -Value $deletedUsersArray -Force
+    if ($deletedUsers -and $deletedUsers.Count -gt 0) {
+        $deletedUsers = $deletedUsers.Trim(",")
+        $deletedUsersArray = $deletedUsers.Split(",")
+        $bodyObj = New-Object -TypeName psobject
+        $bodyObj | Add-Member -MemberType NoteProperty -Name userPrincipalNames -Value $deletedUsersArray -Force
 
-    $body += $bodyObj | ConvertTo-Json
+        $body += $bodyObj | ConvertTo-Json
 
-    Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_UNASSIGN_LICENSE -Body $body
-    Write-Host "$count deleted users licenses removed."
+        Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_UNASSIGN_LICENSE -Body $body
+        Write-Host "$count deleted users licenses removed."
+    } else {
+        Write-Host "There were no deleted users to remove licenses from."
+    }
 }
 #endregion
 
-# Get all Spanning Users
+# Get licened Spanning users NOT in AD.
 if ($null -eq $users) {
-    Write-Host "Getting users."
+    Write-Host "Getting Spanning users NOT in AD."
     $users = get-spanning-users
 }
 else {
-    Write-Host "Using cached users. Set `$users = `$null to pull them down again, `
+    Write-Host "Using cached Spanning users. Set `$users = `$null to pull them down again, `
     it takes a while depending on the amount of users."
 }
 
@@ -155,9 +230,19 @@ else {
     Write-Host "Using cached user list. Set `$msolUsers to `$null to refresh the list."
 }
 $e5s = ($msolUsers | Where-Object `
-    { ($_.licenses).AccountSkuId -match "EnterprisePremium" }).UserPrincipalName
+    { ($_.licenses).AccountSkuId -match "EnterprisePremium" })
+$e5sWithMailBoxes = Get-Accounts-With-Mailboxes $e5s
+$e5UPNs = $e5sWithMailBoxes.UserPrincipalName
+$e5sWithoutMailbox = ($e5s | Where-Object `
+    { ($_.MSExchRecipientTypeDetails) -eq $null })#.UserPrincipalName
+Export-MsoUser-Object-To-CSV $e5sWithoutMailbox
 
-# Get licened Spanning users.
+# Get licened Spanning users in AD.
+$users = $null
+Write-Host "Getting Spanning users in AD."
+$users = get-spanning-users $API_USER_URL_ACTIVE
+
+
 if ($null -eq $licensedUsers) {
     $licensedUsers = get-spanning-licensed-users-licenses $users
 }
@@ -166,6 +251,6 @@ else {
 }
 
 # Add Spanning licenses to E5 users.
-if ($null -ne $e5s) {
-    add-spanning-licenses-to-e5s $licensedUsers, $e5s
+if ($null -ne $e5UPNs) {
+    add-spanning-licenses-to-e5s $licensedUsers, $e5UPNs
 }
