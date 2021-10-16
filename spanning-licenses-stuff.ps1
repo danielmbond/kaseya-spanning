@@ -10,7 +10,7 @@ Clear-Host
 # Install-Module Microsoft.PowerShell.SecretManagement -AllowPrerelease
 # Install-Module Microsoft.PowerShell.SecretStore -AllowPrerelease
 # Register-SecretVault -Name SecretStore -ModuleName Microsoft.PowerShell.SecretStore -DefaultVault
-# Set-Secret -Name SpanningAPIKey -Secret APIKEY
+# Set-Secret -Name SpanningAPIKey -Secret "APIKEY"
 # Set-Secret -Name SpanningLogin -Secret "EMAIL_ADDRESS"
 # Set-Secret -Name 365Login -Secret "EMAIL_ADDRESS"
 # Set-Secret -Name 365Password -Secret "PASSWORD"
@@ -23,10 +23,12 @@ Write-Host "Here we go."
 $APIKEY = Get-Secret -Vault SecretStore -Name SpanningAPIKey -AsPlainText
 $USERNAME = Get-Secret -Vault SecretStore -Name SpanningLogin -AsPlainText
 $API_URL = "https://o365-api-us.spanningbackup.com/"
-$API_USER_URL_ACTIVE = $API_URL + "external/users?inActiveDirectory=false&size=500"
+$API_USER_URL_ACTIVE = $API_URL + "external/users?inActiveDirectory=true&size=500"
 $API_USER_URL_DELETED = $API_URL + "external/users?inActiveDirectory=false&size=500"
 $API_ASSIGN_LICENSE = $API_URL + "external/users/assign"
 $API_UNASSIGN_LICENSE = $API_URL + "external/users/unassign"
+$UNASSIGN_USER_FILE = 'no-ad-license.txt'
+$DAYS_BEFORE_PURGE = 30
 $spanningCred = $USERNAME + ":" + $APIKEY
 $spanningCred64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($spanningCred))
 $header = @{"Authorization" = "Basic " + $spanningCred64 }
@@ -36,7 +38,7 @@ $M365_USERNAME = Get-Secret -Vault SecretStore -Name 365Login -AsPlainText
 [pscredential]$m365Cred = New-Object System.Management.Automation.PSCredential($M365_USERNAME, $M365_PASSWORD)
 
 #region Fuctions
-function add-spanning-licenses($addUsers) {
+function add-spanning-licenses($addUsers, $dryrun = $false) {
     if ($addUsers -and $addUsers.Count -gt 0) {
         $addUsers = $addUsers.Trim(",")
         $addUsersArray = $addUsers.Split(",")
@@ -46,45 +48,75 @@ function add-spanning-licenses($addUsers) {
         $body = $bodyObj | ConvertTo-Json
 
         try {
-            Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_ASSIGN_LICENSE -Body $body
-        } catch {Failure}
+            if ($dryrun -eq $false) {
+                Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_ASSIGN_LICENSE -Body $body
+            }
+        }
+        catch {}
     
         $addUsers = ""
         Write-Host "$($addUsersArray.Count) users added to Spanning Licenses."
-    } else {
+    }
+    else {
         Write-Host 
     }
 }
 
-function add-spanning-licenses-to-e5s($licensedUsers = $licensedUsers, $e5s = $e5UPNs) {
+function add-spanning-licenses-to-m365LicensedUsers($licensedUsers = $licensedUsers, $m365LicensedUsers = $e5UPNs, $dryrun = $false) {
     $addUsers = ""
     $count = 0
-    foreach ($e5 in $e5s) {
-        if ($licensedUsers.$e5 -ne $true) {
-            $addUsers += "$($e5),"
+    foreach ($m365LicensedUser in $m365LicensedUsers) {
+        if ($licensedUsers.$m365LicensedUser -ne $true) {
+            $addUsers += "$($m365LicensedUser),"
             $count++
-            if ($count % 100 -eq 0) { 
-                add-spanning-licenses $addUsers
+            if ($count % 100 -eq 0) {
+                add-spanning-licenses $addUsers $dryrun
                 $addUsers = ""
             }
         }
     }
-    add-spanning-licenses $addUsers
+    add-spanning-licenses $addUsers $dryrun
     write-host "$count total Spanning Licenses added."
+}
+
+function Add-UsersToDelete($file = $UNASSIGN_USER_FILE, $users = $users) {
+    $allUsers = [System.Collections.ArrayList]@()
+    if ((Test-Path -LiteralPath $file)) {
+        try {
+            [System.Collections.ArrayList]$savedUsers = Get-Content -Raw $file | ConvertFrom-Json
+            foreach ($savedUser in $savedUsers) {
+                $allUsers.Add($savedUser)
+            }
+        }
+        catch {}
+    }
+
+    if ($null -ne $users) {
+        foreach ($user in $users) {
+            if ($savedUsers.userPrincipalName.Contains($user.userPrincipalName) -eq $false) {
+                Add-Member -InputObject $user -MemberType NoteProperty -Name dateDeleted -Value $(get-date).ToString()
+                $allUsers.Add($user)
+                Write-Host "$($user.displayName) added."
+            }
+            else {
+                write-host "$($user.userPrincipalName) exists."
+            }
+        }       
+    }
+    $allUsers | ConvertTo-Json | Out-File $file
+    return $allUsers
 }
 
 function Expand-UserProperties($user) {
     $userColumns = "DisplayName", "UserPrincipalName", "AccountEnabled", `
-        "LastDirSyncTime", "Mail", `
-        "MailNickName", "MSExchRecipientTypeDetails", "ObjectId", `
-        "RefreshTokensValidFromDateTime", `
-        "UserType", "WhenCreated"
+        "LastDirSyncTime", "Mail", "MailNickName", "MSExchRecipientTypeDetails", "ObjectId", `
+        "RefreshTokensValidFromDateTime", "UserType", "WhenCreated"
     $userTemp = $user | Select-Object $userColumns
 
     return $userTemp
 }
 
-function Export-MsoUser-Object-To-CSV ($msoUsers=$e5s, $outfile=$null) {
+function Export-MsoUser-Object-To-CSV ($msoUsers = $e5s, $outfile = $null) {
     if ($null -eq $outfile) {
         $outfile = Get-Outfile
     }
@@ -101,34 +133,54 @@ function Export-MsoUser-Object-To-CSV ($msoUsers=$e5s, $outfile=$null) {
     }
 }
 
-function Get-Outfile($new=$false) {
+function Get-OldUsers([string]$file = $UNASSIGN_USER_FILE, $purgeAfter = $DAYS_BEFORE_PURGE) {
+    if ((Test-Path -LiteralPath $file)) {
+        $savedUsers = Get-Content -Raw $file | ConvertFrom-Json
+        try {
+            if ($savedUsers.Count -lt 114) {
+                return $null
+            }
+        }
+        catch {
+            return $null
+        }
+        return $savedUsers
+    }
+    return $null
+}
+
+function Get-UsersToDelete($users = $users) {
+    $pendingDeletes = Get-OldUsers
+    if ($pendingDeletes) {
+
+    }
+    if ($users) {
+
+    }
+    if ($null -ne $users) {
+        Add-Member -InputObject $tester -MemberType NoteProperty -Name dateDeleted -Value $(Get-Date)
+        $newUsers.Userprincipalname.Contains("jmfxygs@jmfamily.com")
+    }
+}
+
+function Get-Outfile($new = $false) {
     $datetime = (Get-Date -Format "yyyyMMdd-HHmmssK").Replace(":", "")
     $desktop = "$env:HOMEDRIVE$env:HOMEPATH\Desktop"
     $Global:outfile = "$desktop\output-$datetime.csv"
     if ($new -or $null -eq $Global:outfile) {
         return $Global:outfile
-    } else {
+    }
+    else {
         return $Global:outfile
     }
 }
 
-function Failure {
-    $global:helpme = $body
-    $global:helpmoref = $moref
-    $global:result = $_.Exception.Response.GetResponseStream()
-    $global:reader = New-Object System.IO.StreamReader($global:result)
-    $global:responseBody = $global:reader.ReadToEnd();
-    Write-Host -BackgroundColor:Black -ForegroundColor:Red "Status: A system exception was caught."
-    Write-Host -BackgroundColor:Black -ForegroundColor:Red $global:responsebody
-    Write-Host -BackgroundColor:Black -ForegroundColor:Red "The request body has been saved to `$global:helpme"
-}
-
 function Get-Accounts-With-Mailboxes ($accounts) {
-#MSExchRecipientTypeDetails
+    #MSExchRecipientTypeDetails
     $accountsWithMailbox = @{}
     foreach ($account in $accounts) {
         if ($null -ne $account.MSExchRecipientTypeDetails) {
-            $accountsWithMailbox.Add($account,$true)
+            $accountsWithMailbox.Add($account, $true)
         }
     }
     return ($accountsWithMailbox.Keys)
@@ -179,15 +231,28 @@ function get-spanning-licensed-users-licenses($users = $users) {
     return $licensedUsers
 }
 
-function remove-spanning-deleted-users-licenses($users = $users) {
+function get-timespan($start, $end) {
+    $value = 1
+    if ($null -eq $start -or $null -eq $end) {
+        return $value
+    }
+    else {
+        $value = New-TimeSpan -Start $start -End $end
+    }
+    return $value
+}
+
+function remove-spanning-deleted-users-licenses([System.Collections.ArrayList]$users = $users, [int]$purge = $DAYS_BEFORE_PURGE, [string]$file = $UNASSIGN_USER_FILE) {
     $deletedUsers = ""
     $count = 0
+    $now = Get-Date
+    # DEFECT need to account for single item strings
     foreach ($user in $users) {
-        if ($user.isDeleted -eq $true) {
+        $dateDeleted = $user.dateDeleted
+        if ($user.isDeleted -eq $true -and (get-timespan $now $dateDeleted) -gt $purge) {
             $deletedUsers += "$($user.userPrincipalName),"
+            $users.RemoveAt($users.IndexOf($user))
             $count++
-            Write-Host $count
-            Write-Host $($deletedUsers.Count)
         }
     }
     if ($deletedUsers -and $deletedUsers.Count -gt 0) {
@@ -195,47 +260,59 @@ function remove-spanning-deleted-users-licenses($users = $users) {
         $deletedUsersArray = $deletedUsers.Split(",")
         $bodyObj = New-Object -TypeName psobject
         $bodyObj | Add-Member -MemberType NoteProperty -Name userPrincipalNames -Value $deletedUsersArray -Force
-
+        write-host $bodyObj
         $body += $bodyObj | ConvertTo-Json
-
+        Write-Host $body
         Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_UNASSIGN_LICENSE -Body $body
         Write-Host "$count deleted users licenses removed."
-    } else {
+    }
+    else {
         Write-Host "There were no deleted users to remove licenses from."
     }
+    $users | ConvertTo-Json | Out-File $file
 }
 #endregion
 
 # Get licened Spanning users NOT in AD.
-if ($null -eq $users) {
-    Write-Host "Getting Spanning users NOT in AD."
-    $users = get-spanning-users
+Write-Host "Getting Spanning users NOT in AD."
+if (!$go) {
+    $usersToDelete = get-spanning-users
+    $backupUser = $usersToDelete | Select-Object *
+    $go = $true
 }
 else {
-    Write-Host "Using cached Spanning users. Set `$users = `$null to pull them down again, `
-    it takes a while depending on the amount of users."
+    Write-Host "Using cached users. Set `$go = `$false to pull down the list again."
+    $usersToDelete = $backupUser | Select-Object *
 }
+[System.Collections.ArrayList]$savedUsers = Add-UsersToDelete $UNASSIGN_USER_FILE $usersToDelete
+#$savedUsers
 
 # Remove License from deleted Users.
-if ($null -ne $users) {
+if ($null -ne $savedUsers) {
     Write-Host "Removing licenses from users that have been deleted."
-    remove-spanning-deleted-users-licenses $users
+    remove-spanning-deleted-users-licenses $savedUsers
 }
 
-# Apply Licenses to E5 Users.
+
 if ($null -eq $msolUsers) {
-    $msolUsers = Get-m365-Users $m365Cred
+    try {
+        $msolUsers = Get-m365-Users $m365Cred
+    }
+    catch { 
+        write-host "Failed to connect ot microsoft, check username and password."
+        break
+    }
 }
 else {
     Write-Host "Using cached user list. Set `$msolUsers to `$null to refresh the list."
 }
-$e5s = ($msolUsers | Where-Object `
-    { ($_.licenses).AccountSkuId -match "EnterprisePremium" })
-$e5sWithMailBoxes = Get-Accounts-With-Mailboxes $e5s
-$e5UPNs = $e5sWithMailBoxes.UserPrincipalName
-$e5sWithoutMailbox = ($e5s | Where-Object `
-    { ($_.MSExchRecipientTypeDetails) -eq $null })#.UserPrincipalName
-Export-MsoUser-Object-To-CSV $e5sWithoutMailbox
+
+$e5UPNs = ($msolUsers | Where-Object `
+    { ($_.licenses).AccountSkuId -match "EnterprisePremium" }).UserPrincipalName
+$f3UPNs = ($msolUsers | Where-Object `
+    { ($_.licenses).AccountSkuId -match "SPE_F1" }).UserPrincipalName
+
+$upns = $e5UPNs + $f3UPNs
 
 # Get licened Spanning users in AD.
 $users = $null
@@ -251,6 +328,9 @@ else {
 }
 
 # Add Spanning licenses to E5 users.
-if ($null -ne $e5UPNs) {
-    add-spanning-licenses-to-e5s $licensedUsers, $e5UPNs
+if ($null -ne $upns) {
+    add-spanning-licenses-to-m365LicensedUsers $licensedUsers, $e5UPNs
+    $e5UPNs = $null
 }
+#>
+
