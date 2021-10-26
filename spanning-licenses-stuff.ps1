@@ -29,6 +29,7 @@ $API_ASSIGN_LICENSE = $API_URL + "external/users/assign"
 $API_UNASSIGN_LICENSE = $API_URL + "external/users/unassign"
 $UNASSIGN_USER_FILE = 'no-ad-license.txt'
 $DAYS_BEFORE_PURGE = 30
+
 $spanningCred = $USERNAME + ":" + $APIKEY
 $spanningCred64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($spanningCred))
 $header = @{"Authorization" = "Basic " + $spanningCred64 }
@@ -57,9 +58,6 @@ function add-spanning-licenses($addUsers, $dryrun = $false) {
         $addUsers = ""
         Write-Host "$($addUsersArray.Count) users added to Spanning Licenses."
     }
-    else {
-        Write-Host 
-    }
 }
 
 function add-spanning-licenses-to-m365LicensedUsers($licensedUsers = $licensedUsers, $m365LicensedUsers = $e5UPNs, $dryrun = $false) {
@@ -84,8 +82,12 @@ function Add-UsersToDelete($file = $UNASSIGN_USER_FILE, $users = $users) {
     if ((Test-Path -LiteralPath $file)) {
         try {
             [System.Collections.ArrayList]$savedUsers = Get-Content -Raw $file | ConvertFrom-Json
-            foreach ($savedUser in $savedUsers) {
-                $allUsers.Add($savedUser)
+            if ($savedUsers.Count -gt 0) {
+                foreach ($savedUser in $savedUsers) {
+                    $allUsers.Add($savedUser) | Out-Null
+                }
+            } else {
+                $savedUsers = $null
             }
         }
         catch {}
@@ -93,13 +95,13 @@ function Add-UsersToDelete($file = $UNASSIGN_USER_FILE, $users = $users) {
 
     if ($null -ne $users) {
         foreach ($user in $users) {
-            if ($savedUsers.userPrincipalName.Contains($user.userPrincipalName) -eq $false) {
-                Add-Member -InputObject $user -MemberType NoteProperty -Name dateDeleted -Value $(get-date).ToString()
-                $allUsers.Add($user)
-                Write-Host "$($user.displayName) added."
-            }
-            else {
+            Add-Member -InputObject $user -MemberType NoteProperty -Name dateDeleted -Value $(get-date).ToString()
+            $allUsers.Add($user) | Out-Null
+            if ($null -ne $savedUsers -and $savedUsers.userPrincipalName.Contains($user.userPrincipalName) -eq $true) {
+                $allUsers.Remove($user)
                 write-host "$($user.userPrincipalName) exists."
+            } else {
+                Write-Host "$($user.displayName) added."
             }
         }       
     }
@@ -246,15 +248,19 @@ function remove-spanning-deleted-users-licenses([System.Collections.ArrayList]$u
     $deletedUsers = ""
     $count = 0
     $now = Get-Date
+    $removeUsers = [System.Collections.ArrayList]@()
     # DEFECT need to account for single item strings
     foreach ($user in $users) {
         $dateDeleted = $user.dateDeleted
-        if ($user.isDeleted -eq $true -and (get-timespan $now $dateDeleted) -gt $purge) {
+        $daySinceDeleted = get-timespan $now $dateDeleted
+        if ($user.isDeleted -eq $true -and $daySinceDeleted -gt $purge -and $user.GetType() -ne [Int32]) {
             $deletedUsers += "$($user.userPrincipalName),"
-            $users.RemoveAt($users.IndexOf($user))
+            $removeUsers.Add($user) | Out-Null
+            write-host $count $daySinceDeleted
             $count++
         }
     }
+
     if ($deletedUsers -and $deletedUsers.Count -gt 0) {
         $deletedUsers = $deletedUsers.Trim(",")
         $deletedUsersArray = $deletedUsers.Split(",")
@@ -263,14 +269,21 @@ function remove-spanning-deleted-users-licenses([System.Collections.ArrayList]$u
         write-host $bodyObj
         $body += $bodyObj | ConvertTo-Json
         Write-Host $body
-        Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_UNASSIGN_LICENSE -Body $body
+        try {
+            Invoke-RestMethod -Method Post -Headers $header -ContentType "application/json" -uri $API_UNASSIGN_LICENSE -Body $body
+        } catch {
+        }
         Write-Host "$count deleted users licenses removed."
     }
     else {
         Write-Host "There were no deleted users to remove licenses from."
     }
+    foreach($removeUser in $removeUsers) {
+        $users.Remove($removeUser)
+    }
     $users | ConvertTo-Json | Out-File $file
 }
+#remove-spanning-deleted-users-licenses $savedUsers
 #endregion
 
 # Get licened Spanning users NOT in AD.
@@ -292,7 +305,6 @@ if ($null -ne $savedUsers) {
     Write-Host "Removing licenses from users that have been deleted."
     remove-spanning-deleted-users-licenses $savedUsers
 }
-
 
 if ($null -eq $msolUsers) {
     try {
@@ -329,8 +341,9 @@ else {
 
 # Add Spanning licenses to E5 users.
 if ($null -ne $upns) {
-    add-spanning-licenses-to-m365LicensedUsers $licensedUsers, $e5UPNs
+    add-spanning-licenses-to-m365LicensedUsers $licensedUsers, $upns
     $e5UPNs = $null
+    $f3UPNs = $null
+    $upns = $null
 }
 #>
-
