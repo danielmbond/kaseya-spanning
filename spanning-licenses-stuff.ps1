@@ -302,7 +302,7 @@ else {
 
 # Remove License from deleted Users.
 if ($null -ne $savedUsers) {
-    Write-Host "Removing licenses from users that have been deleted."
+    Write-Host "Removing licenses from users that have been deleted in the last $DAYS_BEFORE_PURGE days."
     remove-spanning-deleted-users-licenses $savedUsers
 }
 
