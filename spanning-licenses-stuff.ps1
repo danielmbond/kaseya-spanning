@@ -13,11 +13,11 @@ Clear-Host
 # Set-Secret -Name SpanningAPIKey -Secret "APIKEY"
 # Set-Secret -Name SpanningLogin -Secret "EMAIL_ADDRESS"
 # Set-Secret -Name 365Login -Secret "EMAIL_ADDRESS"
-# Set-Secret -Name 365Password -Secret "PASSWORD"
+# Set-Secret -Name 365Password -Secret "PASSWORD;"
 #endregion
 
 Import-Module MSOnline
-
+Get-Date
 Write-Host "Here we go."
 
 $APIKEY = Get-Secret -Vault SecretStore -Name SpanningAPIKey -AsPlainText
@@ -99,7 +99,7 @@ function Add-UsersToDelete($file = $UNASSIGN_USER_FILE, $users = $users) {
             $allUsers.Add($user) | Out-Null
             if ($null -ne $savedUsers -and $savedUsers.userPrincipalName.Contains($user.userPrincipalName) -eq $true) {
                 $allUsers.Remove($user)
-                write-host "$($user.userPrincipalName) exists."
+                # write-host "$($user.userPrincipalName) exists."
             } else {
                 Write-Host "$($user.displayName) added."
             }
@@ -192,7 +192,14 @@ function Get-m365-Users($m365Cred = $m365Cred) {
     Import-Module MSOnline
     Connect-MsolService -Credential $m365Cred
     Write-Host "Getting users, this will take a few minutes."
-    $msolUsers = Get-MsolUser -All -Verbose
+    try {
+        $msolUsers = Get-MsolUser -All -Verbose
+    } catch { 
+        write-host "Failed to connect ot microsoft, check username and password."
+        break
+        return break
+    }
+    
     return $msolUsers
 }
 
@@ -252,8 +259,9 @@ function remove-spanning-deleted-users-licenses([System.Collections.ArrayList]$u
     # DEFECT need to account for single item strings
     foreach ($user in $users) {
         $dateDeleted = $user.dateDeleted
-        $daySinceDeleted = get-timespan $now $dateDeleted
-        if ($user.isDeleted -eq $true -and $daySinceDeleted -gt $purge -and $user.GetType() -ne [Int32]) {
+        $daySinceDeleted = (get-timespan $now $dateDeleted).Days
+#        [Math]::Abs($daySinceDeleted)
+        if ($user.isDeleted -eq $true -and [Math]::Abs($daySinceDeleted) -gt $purge -and $user.GetType() -ne [Int32]) {
             $deletedUsers += "$($user.userPrincipalName),"
             $removeUsers.Add($user) | Out-Null
             write-host $count $daySinceDeleted
